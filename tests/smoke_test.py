@@ -62,7 +62,7 @@ def run_pipeline():
         cmd = [sys.executable, str(ROOT / "experiments/collect.py"), "--tiny", "--out", tmp,
                "--contexts", "64", "--context-tokens", "12", "--window", "16",
                "--sources", "2", "4", "6", "--depths", "2", "4", "6", "8",
-               "--temperatures", "1.0", "--batch", "8"]
+               "--temperatures", "0", "1.0", "--batch", "8"]
         subprocess.run(cmd, check=True)
         subprocess.run([sys.executable, str(ROOT / "experiments/analyze.py"), "--run", tmp], check=True)
     print("ok: collect -> analyze end to end")

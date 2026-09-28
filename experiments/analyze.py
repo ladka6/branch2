@@ -11,6 +11,9 @@ Sections:
   E. Memory-bound cost model: best 2-level vs best 3-level speedup.
   F. L_f-free predictors of final acceptance (entropy, margin, lookahead TV).
   G. Position drift of L_i->L_f acceptance inside the window.
+  H. Stage-1 target design: which r built from p_d, p_i maximizes final acceptance per cost.
+
+T=0 runs are greedy: acceptance is argmax agreement and B/C are skipped.
 
 Usage:
   python experiments/analyze.py --run runs/wt2
@@ -51,6 +54,40 @@ def spearman(x: np.ndarray, y: np.ndarray) -> float:
     return float(pd.Series(x).corr(pd.Series(y), method="spearman"))
 
 
+def tau_curve_from(acc: np.ndarray):
+    """acc: [W, N] per-position acceptance probabilities. Returns E[accepted | n proposed]
+    for n = 1..N and its standard error over windows."""
+    per_window = np.cumsum(np.cumprod(acc, axis=1), axis=1)
+    return per_window.mean(0), per_window.std(0) / np.sqrt(per_window.shape[0])
+
+
+def expected_rounds_from(acc: np.ndarray, gamma: int, n_max: int) -> np.ndarray:
+    """R[n] = expected stage-1 rounds (propose gamma, verify) to accumulate at least n
+    tentative tokens. A round yields tau+1 tokens with P(tau >= k) = E[prod_{j<=k} acc_j].
+    Renewal recursion, so a window always costs at least one full round."""
+    surv = np.cumprod(acc[:, :gamma], axis=1).mean(0)   # P(tau>=k), k=1..gamma
+    ge = np.concatenate([[1.0], surv, [0.0]])           # P(tau>=k), k=0..gamma+1
+    p_tau = ge[:-1] - ge[1:]                             # P(tau=k), k=0..gamma
+    R = np.zeros(n_max + 1)
+    for n in range(1, n_max + 1):
+        R[n] = 1.0 + sum(p_tau[k] * R[max(0, n - k - 1)] for k in range(gamma + 1))
+    return R
+
+
+def best_speedup(stage1_acc, final_curve, d, i, L, H, mode, n_max, gammas):
+    """Best (speedup, gamma, Ni) of a 3-level pipeline under the memory-bound cost model."""
+    c = lambda k: k + H  # noqa: E731
+    best = (0.0, None, None)
+    for g in gammas:
+        rounds = expected_rounds_from(stage1_acc, g, n_max)
+        stage1 = g * c(d) + (c(i) if mode == "noreuse" else (i - d) + H)
+        fin = c(L) if mode == "noreuse" else (L - i) + H
+        for ni in range(1, n_max + 1):
+            tok = final_curve[ni - 1] + 1
+            best = max(best, (c(L) * tok / (rounds[ni] * stage1 + fin), g, ni))
+    return best
+
+
 class Run:
     def __init__(self, run_dir: Path, T: float):
         self.meta = json.loads((run_dir / "meta.json").read_text())
@@ -70,34 +107,33 @@ class Run:
                     self.data[s] = {k: z[k] for k in z.files}
         self.sources = sorted(self.data)
         self.H = self.meta["cost"]["head_in_layers"]
+        self.greedy = T == 0
 
-    # per-token acceptance prob of the sampled token, drafter s -> verifier v
+    # per-token acceptance prob of the drafted token, drafter s -> verifier v.
+    # Sampling: min(1, p_v/p_s). Greedy: 1 if the verifier's argmax is the token.
     def alpha(self, s: int, v: int) -> np.ndarray:
+        if self.greedy:
+            D = self.data[s]
+            return (D["argmax"][..., self.di[v]] == D["tokens"]).astype(np.float64)
         lp = self.data[s]["tok_logp"]
         return np.minimum(1.0, np.exp(lp[..., self.di[v]] - lp[..., self.di[s]]))
 
     # E[accepted tokens | proposal length n] for n = 1..N, plus standard error
     def tau_curve(self, s: int, v: int):
-        surv = np.cumprod(self.alpha(s, v), axis=1)
-        per_window = np.cumsum(surv, axis=1)
-        return per_window.mean(0), per_window.std(0) / np.sqrt(per_window.shape[0])
+        return tau_curve_from(self.alpha(s, v))
 
     def tv(self, s: int, a: int, b: int) -> np.ndarray:
         a, b = min(a, b), max(a, b)
         return self.data[s]["tv"][..., self.pi[(a, b)]]
 
     def expected_rounds(self, d: int, i: int, gamma: int, n_max: int) -> np.ndarray:
-        """R[n] = expected stage-1 rounds (draft gamma at L_d, verify at L_i) to
-        accumulate at least n tentative tokens. A round yields tau+1 tokens with
-        P(tau >= k) = E[prod_{j<=k} alpha_d->i]. Renewal recursion, so a window
-        always costs at least one full round (no fractional rounds)."""
-        surv = np.cumprod(self.alpha(d, i)[:, :gamma], axis=1).mean(0)  # P(tau>=k), k=1..gamma
-        ge = np.concatenate([[1.0], surv, [0.0]])                      # P(tau>=k), k=0..gamma+1
-        p_tau = ge[:-1] - ge[1:]                                        # P(tau=k), k=0..gamma
-        R = np.zeros(n_max + 1)
-        for n in range(1, n_max + 1):
-            R[n] = 1.0 + sum(p_tau[k] * R[max(0, n - k - 1)] for k in range(gamma + 1))
-        return R
+        return expected_rounds_from(self.alpha(d, i), gamma, n_max)
+
+    def prop(self, s: int, a: int, cand: str, field: str) -> np.ndarray:
+        k_a = self.meta["proposal_lower"][str(s)].index(a)
+        k_c = self.meta["proposals"].index(cand)
+        k_f = self.meta["proposal_fields"].index(field)
+        return self.data[s]["prop"][..., k_a, k_c, k_f].astype(np.float64)
 
     def trip(self, s: int, a: int, b: int, field: str) -> np.ndarray:
         return self.data[s]["triple"][..., self.ti[s][(a, s, b)], self.tf[field]]
@@ -219,14 +255,7 @@ def section_e(r: Run, rep: Report, rows_out: list):
             for d in r.sources:
                 if d >= i:
                     continue
-                best = (0, None, None)
-                for g in gammas:
-                    rounds = r.expected_rounds(d, i, g, N)
-                    stage1 = g * c(d) + (c(i) if mode == "noreuse" else (i - d) + H)
-                    for ni in range(1, N + 1):
-                        tok = curves[(i, L)][ni - 1] + 1
-                        cost = rounds[ni] * stage1 + (c(L) if mode == "noreuse" else (L - i) + H)
-                        best = max(best, (c(L) * tok / cost, g, ni))
+                best = best_speedup(r.alpha(d, i), curves[(i, L)], d, i, L, H, mode, N, gammas)
                 rows.append({"mode": mode, "config": f"L{d}->L{i}->L{L}", "levels": 3,
                              "speedup": best[0], "gamma": best[1], "Ni": best[2]})
     df = pd.DataFrame(rows)
@@ -287,6 +316,83 @@ def section_g(r: Run, rep: Report):
     rep.table(pd.DataFrame(rows))
 
 
+def section_h(r: Run, rep: Report, rows_out: list):
+    first = r.data[r.sources[0]]
+    if "prop" not in first:
+        rep("\n[H] (no proposal data in this run; recollect with the current collect.py)")
+        return
+    names = r.meta["proposals"]
+    combos = [c for c in names if c not in ("base",) and not c.startswith("sh")]
+    sharps = [c for c in names if c.startswith("sh")]
+    L, H, N = r.L, r.H, first["tokens"].shape[1]
+    gammas = range(1, min(N, 12) + 1)
+    fin_field = "final_agree" if r.greedy else "final_acc"
+
+    rep("\n[H] Stage-1 target design. Stage 1 does lossless speculative sampling from L_d toward a "
+        "target r built from p_d and p_i (same cost as HiSpec stage 1); L_f then corrects to p_f.")
+    rep("    s1  = 1-TV(p_d, r): stage-1 per-token acceptance.  fin = 1-TV(r, p_f): L_f per-token "
+        "acceptance" + (" (greedy: argmax agreement)" if r.greedy else "") + ".")
+    rep("    combo = best of min/prod/geo/mix/extrapolation; sharp = best temperature-only control on p_i.")
+    if not r.greedy:
+        rep("    speedup columns use per-position expected acceptances (approximation; see calibration).")
+
+    rows, detail = [], []
+    for s in r.sources:
+        for a in r.meta["proposal_lower"][str(s)]:
+            s1 = {c: r.prop(s, a, c, "stage1_acc") for c in names}
+            fi = {c: r.prop(s, a, c, fin_field) for c in names}
+            m1 = {c: s1[c].mean() for c in names}
+            mf = {c: fi[c].mean() for c in names}
+            sp = {}
+            if not r.greedy:
+                for mode in ("noreuse", "reuse"):
+                    for c in names:
+                        sp[(mode, c)] = best_speedup(s1[c], tau_curve_from(fi[c])[0], a, s, L, H,
+                                                     mode, N, gammas)
+            bc = max(combos, key=mf.get)
+            bs = max(sharps, key=mf.get)
+            row = {"d": a, "i": s, "base_s1": m1["base"], "base_fin": mf["base"],
+                   "combo": bc, "combo_s1": m1[bc], "combo_fin": mf[bc],
+                   "sharp": bs, "sharp_fin": mf[bs]}
+            if not r.greedy:
+                for mode, tag in (("noreuse", "nr"), ("reuse", "re")):
+                    bsp = max(names, key=lambda c: sp[(mode, c)][0])
+                    row[f"base_{tag}"] = sp[(mode, "base")][0]
+                    row[f"best_{tag}"] = sp[(mode, bsp)][0]
+                    row[f"by_{tag}"] = bsp
+            rows.append(row)
+            for c in names:
+                d = {"T": r.T, "d": a, "i": s, "cand": c, "s1": m1[c], "fin": mf[c]}
+                if not r.greedy:
+                    for mode in ("noreuse", "reuse"):
+                        v, g, ni = sp[(mode, c)]
+                        d.update({f"speedup_{mode}": v, f"gamma_{mode}": g, f"Ni_{mode}": ni})
+                detail.append(d)
+    rows_out.extend(detail)
+    rep.table(pd.DataFrame(rows))
+
+    focus = [(2, 4), (4, 8), (6, 12)]
+    ddf = pd.DataFrame(detail)
+    for a, s in focus:
+        sub = ddf[(ddf.d == a) & (ddf.i == s)]
+        if len(sub):
+            rep(f"  detail L{a}->L{s}->L{L}:")
+            rep.table(sub.drop(columns=["T", "d", "i"]))
+
+    if not r.greedy:
+        rep("  calibration (base): approximate E[accepted by L_f] at Ni=4 from 1-TV vs exact from sampled windows")
+        cal = []
+        for s in r.sources:
+            a = r.meta["proposal_lower"][str(s)]
+            if not a:
+                continue
+            approx = tau_curve_from(r.prop(s, a[0], "base", "final_acc"))[0]
+            exact = r.tau_curve(s, L)[0]
+            n = min(4, N)
+            cal.append({"L_i": f"L{s}", "approx": approx[n - 1], "exact": exact[n - 1]})
+        rep.table(pd.DataFrame(cal))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--run", required=True)
@@ -301,24 +407,28 @@ def main():
     rep = Report()
     rep(f"run={run_dir} model={meta['model']} corpus={meta['corpus']} "
         f"windows={meta['contexts']} window_len={meta['window']}")
-    trans, cost, pred = [], [], []
+    trans, cost, pred, props = [], [], [], []
     for T in temps:
         r = Run(run_dir, T)
         if not r.data:
             rep(f"(no data for T={T})")
             continue
-        rep("\n" + "=" * 100 + f"\nTemperature {T}\n" + "=" * 100)
+        label = "greedy (acceptance = argmax agreement)" if r.greedy else f"Temperature {T}"
+        rep("\n" + "=" * 100 + f"\n{label}\n" + "=" * 100)
         section_a(r, rep)
-        section_b(r, rep, trans)
-        section_c(r, rep, focus=[])
+        if not r.greedy:  # B and C are about sampling laws
+            section_b(r, rep, trans)
+            section_c(r, rep, focus=[])
         section_d(r, rep)
         section_e(r, rep, cost)
         section_f(r, rep, pred)
         section_g(r, rep)
+        section_h(r, rep, props)
 
     pd.DataFrame(trans).to_csv(out / "stage_transfer.csv", index=False)
     pd.DataFrame(cost).to_csv(out / "cost_model.csv", index=False)
     pd.DataFrame(pred).to_csv(out / "predictors.csv", index=False)
+    pd.DataFrame(props).to_csv(out / "proposals.csv", index=False)
     (out / "report.txt").write_text("\n".join(rep.lines))
     print(f"\nwrote {out}/report.txt and CSVs")
 

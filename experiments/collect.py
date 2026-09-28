@@ -12,7 +12,7 @@ cost model, predictors) is computed on CPU by analyze.py from these files.
 Example (LayerSkip 1B, ~15 min on one A100):
   python experiments/collect.py --out runs/wt2 --corpus wikitext2 \
       --sources 2 4 6 8 10 12 14 --depths 2 4 6 8 10 12 14 16 \
-      --temperatures 0.6 1.0 --contexts 512 --window 32
+      --temperatures 0 0.6 1.0 --contexts 512 --window 32
 """
 
 import argparse
@@ -27,7 +27,9 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from hsx.data import build_contexts, random_contexts  # noqa: E402
-from hsx.lens import TRIPLE_FIELDS, depth_logits, pair_list, triple_list, window_stats  # noqa: E402
+from hsx.lens import (  # noqa: E402
+    PROPOSAL_FIELDS, PROPOSALS, TRIPLE_FIELDS, depth_logits, pair_list, triple_list, window_stats,
+)
 from hsx.models import (  # noqa: E402
     cost_units, load_model, make_early_exit_model, pick_device_dtype, tiny_random_model,
 )
@@ -45,7 +47,7 @@ def main():
     ap.add_argument("--window", type=int, default=32, help="tokens sampled per window (max Ni studied)")
     ap.add_argument("--sources", type=int, nargs="+", default=[2, 4, 6, 8, 10, 12, 14])
     ap.add_argument("--depths", type=int, nargs="+", default=[2, 4, 6, 8, 10, 12, 14, 16])
-    ap.add_argument("--temperatures", type=float, nargs="+", default=[0.6, 1.0])
+    ap.add_argument("--temperatures", type=float, nargs="+", default=[0.0, 0.6, 1.0], help="0 = greedy")
     ap.add_argument("--batch", type=int, default=8)
     ap.add_argument("--seed", type=int, default=7)
     args = ap.parse_args()
@@ -84,6 +86,9 @@ def main():
         "pairs": pair_list(depths),
         "triples": {str(s): triple_list(depths, s) for s in sources},
         "triple_fields": TRIPLE_FIELDS,
+        "proposals": PROPOSALS,
+        "proposal_fields": PROPOSAL_FIELDS,
+        "proposal_lower": {str(s): [d for d in depths if d < s] for s in sources},
         "cost": cost_units(base),
         "seed": args.seed,
         "dtype": str(dtype),
@@ -103,7 +108,8 @@ def main():
                 win = sample_window(drafter, ctx, N, T, gen)
                 full = torch.cat([ctx, win], dim=1)
                 logits = depth_logits(base, full[:, :-1], depths, start=C - 1)
-                parts.append(window_stats(logits, win, T, source=s))
+                # T=0 means greedy windows; distribution stats are then taken at T=1.
+                parts.append(window_stats(logits, win, T if T > 0 else 1.0, source=s))
                 del logits, full, win, ctx
                 if device.type == "cuda":
                     torch.cuda.empty_cache()

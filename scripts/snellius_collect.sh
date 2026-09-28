@@ -17,6 +17,6 @@ cd "$SLURM_SUBMIT_DIR"
 for CORPUS in wikitext2 humaneval gsm8k ultrachat; do
   python experiments/collect.py --out "runs/$CORPUS" --corpus "$CORPUS" \
     --sources 2 4 6 8 10 12 14 --depths 2 4 6 8 10 12 14 16 \
-    --temperatures 0.6 1.0 --contexts 512 --window 32 --batch 8
+    --temperatures 0 0.6 1.0 --contexts 512 --window 32 --batch 8
   python experiments/analyze.py --run "runs/$CORPUS"
 done

@@ -31,6 +31,7 @@ without simulating the full pipeline.
 | E | Best 2-level vs best 3-level speedup, memory-bound cost model | If 3-level never wins, the hierarchy needs a new ingredient, not a better stage-1 verifier |
 | F | Can signals available without L_f predict L_f's acceptance? | Strong predictors -> adaptive Ni / early L_f calls are viable |
 | G | Does acceptance drift along the window? | Sanity check for the stationarity assumption in E |
+| H | Which stage-1 target r, built from p_d and p_i, maximizes L_f acceptance per cost? | The main research question (see below) |
 
 Section B is the precise version of "does stage-1 quality predict final survival". For
 each position it computes, analytically over the whole vocabulary,
@@ -47,6 +48,23 @@ It reports two variants: `noreuse` (every call starts from layer 1) and `reuse`
 only v-u+H). The real number lies between them. It assumes a verification pass costs
 the same regardless of how many tokens it scores (memory-bound decoding), and it treats
 the stage-1 round count as Ni / block_efficiency (fractional).
+
+## Stage-1 target design (section H)
+
+First-run result (wikitext2, T=0.6): tokens that L_i accepted from L_d survive L_f far better
+than tokens L_i resampled from its residual (ratio 0.63-0.73 for shallow L_i). Since L_f
+restores the exact target anyway, stage 1 does not need to be faithful to p_i. It can do
+lossless speculative sampling from L_d toward any target r computable from p_d and p_i
+(accept min(1, r/p_d), resample from (r - p_d)+), at HiSpec's stage-1 cost. L_f then
+verifies with r as the proposal distribution.
+
+Section H scores candidate targets by stage-1 acceptance 1-TV(p_d, r) and final acceptance
+1-TV(r, p_f): consensus min(p_d, p_i), product, geometric mean, mixture, depth extrapolation
+p_i (p_i/p_d)^lambda, and temperature-only controls on p_i (to check that a gain is not just
+sharpening). Speedups in H use per-position expected acceptances, which is an approximation;
+the calibration table compares it with the exact value for the base target.
+
+T=0 runs are greedy: acceptance is argmax agreement, sections B and C are skipped.
 
 ## Layout
 
@@ -80,7 +98,7 @@ Main run (one A100 is plenty; each source depth is 512 windows x 32 sampled toke
 ```
 python experiments/collect.py --out runs/wt2 --corpus wikitext2 \
     --sources 2 4 6 8 10 12 14 --depths 2 4 6 8 10 12 14 16 \
-    --temperatures 0.6 1.0 --contexts 512 --window 32 --batch 8
+    --temperatures 0 0.6 1.0 --contexts 512 --window 32 --batch 8
 python experiments/analyze.py --run runs/wt2
 ```
 

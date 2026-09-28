@@ -16,8 +16,11 @@ def sample_window(model, contexts: torch.Tensor, n_tokens: int, temperature: flo
     past, logits = out.past_key_values, out.logits[:, -1, :]
     toks = []
     for step in range(n_tokens):
-        p = torch.softmax(logits.float() / temperature, dim=-1)
-        nxt = torch.multinomial(p, 1, generator=generator)  # [B,1]
+        if temperature == 0:  # greedy
+            nxt = logits.argmax(-1, keepdim=True)
+        else:
+            p = torch.softmax(logits.float() / temperature, dim=-1)
+            nxt = torch.multinomial(p, 1, generator=generator)  # [B,1]
         toks.append(nxt)
         if step < n_tokens - 1:
             out = model(input_ids=nxt, past_key_values=past, use_cache=True, return_dict=True)
