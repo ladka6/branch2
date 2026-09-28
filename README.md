@@ -66,6 +66,22 @@ the calibration table compares it with the exact value for the base target.
 
 T=0 runs are greedy: acceptance is argmax agreement, sections B and C are skipped.
 
+## Dependent acceptance (experiments/dependence.py)
+
+Mohri et al. (arXiv 2510.19705) model hierarchy latency with acceptance independent across
+levels and positions. Section B shows the L_f acceptance of a token depends on how stage 1
+produced it. dependence.py simulates the lossless L_d -> L_i -> L_f pipeline on the collected
+statistics under three acceptance models (iid, pos = per-position but event-independent,
+dep = per-position and conditioned on the stage-1 event) and three lossless window policies
+(fixed buffer, flush after a stage-1 rejection, stop when stage-1-predicted survival < theta).
+It reports the iid model's prediction error and selection regret, splits the gap into context
+heterogeneity (iid -> pos) and cross-level dependence (pos -> dep), and the part of each
+policy's gain that is due to dependence (gain under dep minus gain under pos). CPU only:
+
+```
+cd experiments && python dependence.py --run ../runs/wt2_v2
+```
+
 ## Layout
 
 ```
@@ -74,7 +90,8 @@ hsx/data.py         fixed-length contexts from wikitext2 / humaneval / ultrachat
 hsx/sampling.py     batched autoregressive sampling from an early exit
 hsx/lens.py         all-depth logits from one forward pass (layer hooks) + per-token stats
 experiments/collect.py   GPU: sample windows per source depth, store compact stats (.npz)
-experiments/analyze.py   CPU: sections A-G, writes analysis/report.txt and CSVs
+experiments/analyze.py   CPU: sections A-H, writes analysis/report.txt and CSVs
+experiments/dependence.py CPU: dependent-acceptance simulation (iid vs pos vs dep, window policies)
 tests/smoke_test.py      offline test on a tiny random Llama (no downloads)
 legacy/                  the original HSD + HiSpec harness
 ```
