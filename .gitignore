@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+runs/
+*.npz
+.ipynb_checkpoints/
+slurm-*.out
