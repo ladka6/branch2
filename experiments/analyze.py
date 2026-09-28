@@ -86,6 +86,19 @@ class Run:
         a, b = min(a, b), max(a, b)
         return self.data[s]["tv"][..., self.pi[(a, b)]]
 
+    def expected_rounds(self, d: int, i: int, gamma: int, n_max: int) -> np.ndarray:
+        """R[n] = expected stage-1 rounds (draft gamma at L_d, verify at L_i) to
+        accumulate at least n tentative tokens. A round yields tau+1 tokens with
+        P(tau >= k) = E[prod_{j<=k} alpha_d->i]. Renewal recursion, so a window
+        always costs at least one full round (no fractional rounds)."""
+        surv = np.cumprod(self.alpha(d, i)[:, :gamma], axis=1).mean(0)  # P(tau>=k), k=1..gamma
+        ge = np.concatenate([[1.0], surv, [0.0]])                      # P(tau>=k), k=0..gamma+1
+        p_tau = ge[:-1] - ge[1:]                                        # P(tau=k), k=0..gamma
+        R = np.zeros(n_max + 1)
+        for n in range(1, n_max + 1):
+            R[n] = 1.0 + sum(p_tau[k] * R[max(0, n - k - 1)] for k in range(gamma + 1))
+        return R
+
     def trip(self, s: int, a: int, b: int, field: str) -> np.ndarray:
         return self.data[s]["triple"][..., self.ti[s][(a, s, b)], self.tf[field]]
 
@@ -208,11 +221,11 @@ def section_e(r: Run, rep: Report, rows_out: list):
                     continue
                 best = (0, None, None)
                 for g in gammas:
-                    b1 = curves[(d, i)][g - 1] + 1
+                    rounds = r.expected_rounds(d, i, g, N)
                     stage1 = g * c(d) + (c(i) if mode == "noreuse" else (i - d) + H)
                     for ni in range(1, N + 1):
                         tok = curves[(i, L)][ni - 1] + 1
-                        cost = (ni / b1) * stage1 + (c(L) if mode == "noreuse" else (L - i) + H)
+                        cost = rounds[ni] * stage1 + (c(L) if mode == "noreuse" else (L - i) + H)
                         best = max(best, (c(L) * tok / cost, g, ni))
                 rows.append({"mode": mode, "config": f"L{d}->L{i}->L{L}", "levels": 3,
                              "speedup": best[0], "gamma": best[1], "Ni": best[2]})
